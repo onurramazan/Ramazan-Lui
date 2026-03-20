@@ -1,0 +1,521 @@
+# ------------------------------ Setup -----------------------------------------
+
+required_packages <- c("glmnet", "ncvreg", "dplyr", "data.table", 
+                       "foreach", "doParallel")
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# ------------------------------ Parameters ------------------------------------
+
+p <- 2000                              # number of predictors
+n_vec <- c(500, 2000, 10000)           # sample sizes
+R <- 100                               # number of replications 
+layer_names <- 1:2                     # only base (1) and compound (2)
+
+# >>>>>>>>>>>>>>>>> IMPOTANT: ADJUST THESE PATHS  <<<<<<<<<<<<<<<<<<
+data_dir <- "./sim_data"                # where the data is stored
+out_dir  <- "./analysis_results"        # where the output is stored
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Create output directory if it doesn't exist
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+# ------------------------------ Helper Functions -----------------------------
+
+calc_accuracy <- function(y_true, y_pred) {
+  ss_res <- sum((y_true - y_pred)^2)
+  ss_tot <- sum((y_true - mean(y_true))^2)
+  r2 <- 1 - ss_res / ss_tot
+  rmse <- sqrt(mean((y_true - y_pred)^2))
+  c(R2 = r2, RMSE = rmse)
+}
+
+# Jaccard index between two sets
+jaccard_pair <- function(set1, set2) {
+  if (length(set1) == 0 && length(set2) == 0) return(1)
+  if (length(set1) == 0 || length(set2) == 0) return(0)
+  inter <- length(intersect(set1, set2))
+  union <- length(union(set1, set2))
+  inter / union
+}
+
+# Compute mean and sd of pairwise Jaccard for a list of selected sets
+pairwise_jaccard_stats <- function(selected_list) {
+  n_sets <- length(selected_list)
+  if (n_sets < 2) return(c(mean = NA, sd = NA))
+  
+  pairs <- combn(1:n_sets, 2, simplify = FALSE)
+  jaccards <- sapply(pairs, function(idx) {
+    jaccard_pair(selected_list[[idx[1]]], selected_list[[idx[2]]])
+  })
+  c(mean = mean(jaccards, na.rm = TRUE), sd = sd(jaccards, na.rm = TRUE))
+}
+
+# Extract non-zero coefficients from model objects
+get_active <- function(model, method, lambda) {
+  if (method == "ridge") return(NA)  # ridge doesn't select
+  
+  coef_vec <- switch(method,
+                     ridge    = NA,
+                     lasso    = as.vector(coef(model$fit, s = lambda))[-1],  # drop intercept
+                     enet     = as.vector(coef(model$fit, s = lambda))[-1],
+                     adalasso = as.vector(coef(model$fit, s = lambda))[-1],
+                     scad     = coef(model$fit, lambda = lambda)[-1],        # ncvreg includes intercept
+                     mcp      = coef(model$fit, lambda = lambda)[-1]
+  )
+  
+  # Find indices where absolute coefficient > 1e-6
+  which(abs(coef_vec) > 1e-6)
+}
+
+# ------------------------------ Method Wrappers ------------------------------
+
+ridge_wrapper <- function(X, y, params) {
+  glmnet(X, y, alpha = 0, lambda = params$lambda, intercept = TRUE)
+}
+lasso_wrapper <- function(X, y, params) {
+  glmnet(X, y, alpha = 1, lambda = params$lambda, intercept = TRUE)
+}
+enet_wrapper <- function(X, y, params) {
+  glmnet(X, y, alpha = params$alpha, lambda = params$lambda, intercept = TRUE)
+}
+adalasso_wrapper <- function(X, y, params) {
+  glmnet(X, y, alpha = 1, lambda = params$lambda, 
+         penalty.factor = params$weights, intercept = TRUE)
+}
+scad_wrapper <- function(X, y, params) {
+  ncvreg(X, y, penalty = "SCAD", lambda = params$lambda, family = "gaussian")
+}
+mcp_wrapper <- function(X, y, params) {
+  ncvreg(X, y, penalty = "MCP", lambda = params$lambda, family = "gaussian")
+}
+
+# ------------------------------ Tuning Functions ------------------------------
+
+tune_ridge <- function(X, y, nfolds = 5) {
+  cv <- cv.glmnet(X, y, alpha = 0, nfolds = nfolds, intercept = TRUE)
+  list(lambda = cv$lambda.min, fit = cv$glmnet.fit)
+}
+tune_lasso <- function(X, y, nfolds = 5) {
+  cv <- cv.glmnet(X, y, alpha = 1, nfolds = nfolds, intercept = TRUE)
+  list(lambda = cv$lambda.min, fit = cv$glmnet.fit)
+}
+tune_enet <- function(X, y, nfolds = 5, alpha_grid = c(0.1, 0.3, 0.5, 0.7, 0.9)) {
+  best_alpha <- NULL; best_lambda <- NULL; best_cvm <- Inf
+  for (a in alpha_grid) {
+    cv <- cv.glmnet(X, y, alpha = a, nfolds = nfolds, intercept = TRUE)
+    if (min(cv$cvm) < best_cvm) {
+      best_cvm <- min(cv$cvm)
+      best_alpha <- a
+      best_lambda <- cv$lambda.min
+    }
+  }
+  fit <- glmnet(X, y, alpha = best_alpha, lambda = best_lambda, intercept = TRUE)
+  list(alpha = best_alpha, lambda = best_lambda, fit = fit)
+}
+tune_adalasso <- function(X, y, nfolds = 5) {
+  cv_ridge <- cv.glmnet(X, y, alpha = 0, nfolds = nfolds, intercept = TRUE)
+  ridge_coef <- as.numeric(coef(cv_ridge, s = "lambda.min"))[-1]
+  ridge_coef <- pmax(abs(ridge_coef), 1e-8)
+  weights <- 1 / ridge_coef
+  cv_lasso <- cv.glmnet(X, y, alpha = 1, penalty.factor = weights, nfolds = nfolds, intercept = TRUE)
+  list(lambda = cv_lasso$lambda.min, weights = weights, fit = cv_lasso$glmnet.fit)
+}
+tune_scad <- function(X, y, nfolds = 5) {
+  cv <- cv.ncvreg(X, y, penalty = "SCAD", nfolds = nfolds, family = "gaussian")
+  list(lambda = cv$lambda.min, fit = cv$fit)
+}
+tune_mcp <- function(X, y, nfolds = 5) {
+  cv <- cv.ncvreg(X, y, penalty = "MCP", nfolds = nfolds, family = "gaussian")
+  list(lambda = cv$lambda.min, fit = cv$fit)
+}
+
+# ------------------------------ Process One Method ---------------------------
+process_method <- function(method, start_rep = 1, end_rep = R) {
+  
+  cat("\n", paste(rep("=", 60), collapse = ""), "\n")
+  cat("Processing method:", method, "\n")
+  cat(paste(rep("=", 60), collapse = ""), "\n")
+  
+  # Convert relative paths to absolute based on master's working directory
+  abs_data_dir <- normalizePath(file.path(getwd(), data_dir), mustWork = FALSE)
+  abs_out_dir  <- normalizePath(file.path(getwd(), out_dir), mustWork = FALSE)
+  
+  # Create output directory if needed
+  if (!dir.exists(abs_out_dir)) {
+    dir.create(abs_out_dir, recursive = TRUE)
+  }
+  
+  # Output file for this method (accuracy results)
+  out_file <- file.path(abs_out_dir, paste0("per_replication_results_", method, ".csv"))
+  # RDS file for active sets (used for stability)
+  active_rds_file <- file.path(abs_out_dir, paste0(method, "_active_sets.rds"))
+  
+  # Check for existing accuracy results
+  start_from <- start_rep
+  if (file.exists(out_file)) {
+    existing <- read.csv(out_file)
+    if (nrow(existing) > 0) {
+      last_rep <- max(existing$rep)
+      start_from <- max(start_from, last_rep + 1)
+      cat("Found existing accuracy results up to replication", last_rep, "\n")
+    }
+  }
+  
+  if (start_from > end_rep) {
+    cat("Method", method, "already completed.\n")
+    return(TRUE)
+  }
+  
+  cat("Processing replications", start_from, "to", end_rep, "\n")
+  
+  # -------------------- Load existing active sets (if any) --------------------
+  all_active <- list()  # each element: list(rep, n, layer, active)
+  if (method != "ridge" && file.exists(active_rds_file)) {
+    saved_active <- tryCatch(readRDS(active_rds_file), error = function(e) NULL)
+    if (!is.null(saved_active) && is.list(saved_active)) {
+      # Keep only those with rep < start_from (already fully processed)
+      saved_active <- saved_active[sapply(saved_active, function(x) x$rep < start_from)]
+      all_active <- saved_active
+      cat("Loaded", length(all_active), "existing active sets from RDS (reps <", start_from, ")\n")
+    }
+  }
+  
+  # ------------------------------ Parallel Setup -----------------------------
+  n_cores <- 5
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  
+  # Export necessary objects
+  clusterExport(cl, varlist = c(
+    "abs_data_dir", "n_vec", "layer_names",
+    "calc_accuracy", "get_active",
+    "ridge_wrapper", "lasso_wrapper", "enet_wrapper",
+    "adalasso_wrapper", "scad_wrapper", "mcp_wrapper",
+    "tune_ridge", "tune_lasso", "tune_enet", "tune_adalasso",
+    "tune_scad", "tune_mcp",
+    "method"
+  ), envir = environment())
+  
+  clusterEvalQ(cl, {
+    library(glmnet)
+    library(ncvreg)
+    library(data.table)
+    library(dplyr)
+  })
+  
+  # ------------------------------ Process in Batches -------------------------
+  batch_size <- 5
+  for (batch_start in seq(start_from, end_rep, by = batch_size)) {
+    batch_end <- min(batch_start + batch_size - 1, end_rep)
+    cat("  Processing batch:", batch_start, "to", batch_end, "\n")
+    
+    batch_results <- foreach(
+      rep = batch_start:batch_end,
+      .packages = c("glmnet", "ncvreg", "data.table", "dplyr"),
+      .errorhandling = "pass"
+    ) %dopar% {
+      
+      # - results_df: data frame of accuracy for this rep (across n and layer)
+      # - active_list: list of active sets for each (n, layer) in this rep
+      
+      rep_results <- data.frame()
+      rep_active <- list()
+      
+      for (n in n_vec) {
+        for (layer in layer_names) {
+          
+          fname <- file.path(abs_data_dir, sprintf("sim_rep%03d_n%d_layer%d.csv", rep, n, layer))
+          
+          if (!file.exists(fname)) {
+            message("      File missing: ", fname)
+            next
+          }
+          
+          df <- fread(fname)
+          y <- df$y
+          X <- as.matrix(df[, -1, with = FALSE])
+          
+          set.seed(rep * 100 + n * 10 + layer)
+          n_train <- floor(0.8 * n)
+          train_idx <- sample(1:n, size = n_train)
+          test_idx  <- setdiff(1:n, train_idx)
+          
+          X_train <- X[train_idx, , drop = FALSE]
+          y_train <- y[train_idx]
+          X_test  <- X[test_idx, , drop = FALSE]
+          y_test  <- y[test_idx]
+          
+          x_mean <- colMeans(X_train)
+          x_sd   <- apply(X_train, 2, sd)
+          x_sd[x_sd == 0] <- 1
+          
+          X_train <- scale(X_train, center = x_mean, scale = x_sd)
+          X_test  <- scale(X_test,  center = x_mean, scale = x_sd)
+          
+          # Tune and fit
+          params <- switch(method,
+                           ridge    = tune_ridge(X_train, y_train),
+                           lasso    = tune_lasso(X_train, y_train),
+                           enet     = tune_enet(X_train, y_train),
+                           adalasso = tune_adalasso(X_train, y_train),
+                           scad     = tune_scad(X_train, y_train),
+                           mcp      = tune_mcp(X_train, y_train)
+          )
+          
+          # Predictions
+          pred_test <- switch(method,
+                              ridge    = predict(params$fit, newx = X_test, s = params$lambda),
+                              lasso    = predict(params$fit, newx = X_test, s = params$lambda),
+                              enet     = predict(params$fit, newx = X_test, s = params$lambda),
+                              adalasso = predict(params$fit, newx = X_test, s = params$lambda),
+                              scad     = predict(params$fit, X = X_test, lambda = params$lambda),
+                              mcp      = predict(params$fit, X = X_test, lambda = params$lambda)
+          )
+          if (is.matrix(pred_test)) pred_test <- pred_test[, 1]
+          
+          acc <- calc_accuracy(y_test, pred_test)
+          
+          # Accuracy row
+          rep_results <- rbind(rep_results, data.frame(
+            rep       = rep,
+            n         = n,
+            layer     = layer,
+            method    = method,
+            R2        = acc["R2"],
+            RMSE      = acc["RMSE"],
+            stringsAsFactors = FALSE
+          ))
+          
+          # Selected set (skip ridge)
+          if (method != "ridge") {
+            active_set <- get_active(params, method, params$lambda)
+            rep_active[[length(rep_active) + 1]] <- list(
+              rep = rep,
+              n = n,
+              layer = layer,
+              active = active_set
+            )
+          }
+        }
+      }
+      
+      list(results = rep_results, active = rep_active)
+    }
+    
+    # Combine results from this batch
+    batch_results_dfs <- lapply(batch_results, function(x) if (is.list(x) && "results" %in% names(x)) x$results else NULL)
+    batch_results_dfs <- batch_results_dfs[!sapply(batch_results_dfs, is.null)]
+    if (length(batch_results_dfs) > 0) {
+      batch_df <- do.call(rbind, batch_results_dfs)
+      
+      # Append to accuracy file (always append if file exists)
+      if (file.exists(out_file)) {
+        existing <- read.csv(out_file)
+        combined <- rbind(existing, batch_df)
+        write.csv(combined, file = out_file, row.names = FALSE)
+      } else {
+        write.csv(batch_df, file = out_file, row.names = FALSE)
+      }
+      cat("    Saved accuracy results. Total rows:", nrow(batch_df), "\n")
+    }
+    
+    # Collect active sets from this batch and update persistent storage
+    if (method != "ridge") {
+      batch_active <- lapply(batch_results, function(x) if (is.list(x) && "active" %in% names(x)) x$active else NULL)
+      batch_active <- batch_active[!sapply(batch_active, is.null)]
+      for (act_list in batch_active) {
+        all_active <- c(all_active, act_list)
+      }
+      # Save updated active sets to RDS (overwrite)
+      saveRDS(all_active, file = active_rds_file)
+      cat("    Saved", length(all_active), "active sets to RDS.\n")
+    }
+    
+    Sys.sleep(1)
+  }
+  
+  stopCluster(cl)
+  
+  # ------------------------------ Stability Computation ----------------------
+  cat("\nComputing pairwise Jaccard stability for method", method, "...\n")
+  
+  # Group active sets by n and layer
+  stability_results <- data.frame()
+  
+  if (method != "ridge" && length(all_active) > 0) {
+    # Convert all_active to a data frame for easier grouping
+    active_df <- do.call(rbind, lapply(all_active, function(x) {
+      data.frame(
+        rep = x$rep,
+        n = x$n,
+        layer = x$layer,
+        active_id = I(list(x$active)),  # list column
+        stringsAsFactors = FALSE
+      )
+    }))
+    
+    for (n_val in n_vec) {
+      for (layer_val in layer_names) {
+        subset_idx <- which(active_df$n == n_val & active_df$layer == layer_val)
+        if (length(subset_idx) >= 2) {
+          sets <- active_df$active_id[subset_idx]
+          stats <- pairwise_jaccard_stats(sets)
+          stability_results <- rbind(stability_results, data.frame(
+            n = n_val,
+            layer = layer_val,
+            method = method,
+            Jaccard_stability_mean = stats["mean"],
+            Jaccard_stability_sd = stats["sd"],
+            stringsAsFactors = FALSE
+          ))
+        } else {
+          stability_results <- rbind(stability_results, data.frame(
+            n = n_val,
+            layer = layer_val,
+            method = method,
+            Jaccard_stability_mean = NA,
+            Jaccard_stability_sd = NA,
+            stringsAsFactors = FALSE
+          ))
+        }
+      }
+    }
+  } else {
+    # Ridge or no active sets
+    for (n_val in n_vec) {
+      for (layer_val in layer_names) {
+        stability_results <- rbind(stability_results, data.frame(
+          n = n_val,
+          layer = layer_val,
+          method = method,
+          Jaccard_stability_mean = NA,
+          Jaccard_stability_sd = NA,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+  }
+  
+  # Save stability results
+  stability_file <- file.path(abs_out_dir, paste0("stability_", method, ".csv"))
+  write.csv(stability_results, file = stability_file, row.names = FALSE)
+  cat("Saved stability results to", stability_file, "\n")
+  
+  # Remove the active RDS file after successful completion 
+  if (method != "ridge" && file.exists(active_rds_file)) {
+    file.remove(active_rds_file)
+    cat("Removed temporary active sets RDS file.\n")
+  }
+  
+  # Verify completion
+  if (file.exists(out_file)) {
+    final_results <- read.csv(out_file)
+    if (max(final_results$rep) >= end_rep) {
+      cat("Method", method, "completed successfully.\n")
+      return(TRUE)
+    } else {
+      cat("Method", method, "incomplete. Last rep:", max(final_results$rep), "\n")
+      return(FALSE)
+    }
+  } else {
+    cat("Method", method, "failed: accuracy file not found.\n")
+    return(FALSE)
+  }
+}
+
+# ------------------------------ Main Loop -------------------------------------
+methods <- c("ridge", "lasso", "enet", "adalasso", "scad", "mcp")
+accuracy_summary <- data.frame()
+stability_summary <- data.frame()
+
+for (method in methods) {
+  
+  success <- process_method(method, start_rep = 1, end_rep = R)
+  
+  if (success) {
+    # Read accuracy results
+    method_acc <- read.csv(file.path(out_dir, paste0("per_replication_results_", method, ".csv")))
+    
+    # Accuracy summary
+    acc_summ <- method_acc %>%
+      group_by(n, layer, method) %>%
+      summarise(
+        R2_mean       = mean(R2, na.rm = TRUE),
+        R2_sd         = sd(R2, na.rm = TRUE),
+        RMSE_mean     = mean(RMSE, na.rm = TRUE),
+        RMSE_sd       = sd(RMSE, na.rm = TRUE),
+        n_reps        = n(),
+        .groups       = "drop"
+      )
+    accuracy_summary <- rbind(accuracy_summary, acc_summ)
+    
+    # Read stability results
+    stab_file <- file.path(out_dir, paste0("stability_", method, ".csv"))
+    if (file.exists(stab_file)) {
+      stab <- read.csv(stab_file)
+      stability_summary <- rbind(stability_summary, stab)
+    }
+    
+    # Save combined summaries after each method
+    write.csv(accuracy_summary, 
+              file = file.path(out_dir, "accuracy_summary_all_methods.csv"),
+              row.names = FALSE)
+    write.csv(stability_summary,
+              file = file.path(out_dir, "stability_summary_all_methods.csv"),
+              row.names = FALSE)
+    
+    cat("Added", method, "to combined summaries.\n")
+  }
+  
+  cat("\nPausing before next method...\n")
+  Sys.sleep(5)
+}
+
+# ------------------------------ Combine All Results --------------------------
+cat("\n", paste(rep("=", 60), collapse = ""), "\n")
+cat("Combining all results\n")
+cat(paste(rep("=", 60), collapse = ""), "\n")
+
+# Combine all accuracy files
+all_acc <- data.frame()
+for (method in methods) {
+  f <- file.path(out_dir, paste0("per_replication_results_", method, ".csv"))
+  if (file.exists(f)) {
+    dat <- read.csv(f)
+    all_acc <- rbind(all_acc, dat)
+    cat("Added accuracy for", method, "with", nrow(dat), "rows\n")
+  }
+}
+write.csv(all_acc, file.path(out_dir, "per_replication_results_all.csv"), row.names = FALSE)
+
+# Combine all stability files
+all_stab <- data.frame()
+for (method in methods) {
+  f <- file.path(out_dir, paste0("stability_", method, ".csv"))
+  if (file.exists(f)) {
+    dat <- read.csv(f)
+    all_stab <- rbind(all_stab, dat)
+    cat("Added stability for", method, "with", nrow(dat), "rows\n")
+  }
+}
+write.csv(all_stab, file.path(out_dir, "stability_results_all.csv"), row.names = FALSE)
+
+# Final merged summary (accuracy + stability)
+final_summary <- accuracy_summary %>%
+  left_join(stability_summary, by = c("n", "layer", "method"))
+
+write.csv(final_summary,
+          file = file.path(out_dir, "final_summary.csv"),
+          row.names = FALSE)
+
+cat("\nAll done! Final files created in:", out_dir, "\n")
+cat("  - per_replication_results_all.csv\n")
+cat("  - stability_results_all.csv\n")
+cat("  - final_summary.csv\n")
