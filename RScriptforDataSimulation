@@ -1,0 +1,146 @@
+# ==================================================================
+
+library(MASS)       # mvrnorm
+library(data.table) # fwrite — fast CSV writer
+library(Matrix)     # sparse/block-diagonal matrix construction
+
+# ------------------------------ Parameters -----------------------------------
+p <- 2000                              # number of predictors
+n_vec <- c(500, 2000, 10000)           # sample sizes
+block_size <- 20                       # predictors per block
+n_blocks <- p / block_size             # 100 blocks
+rho <- 0.4                             # within-block correlation
+R <- 100                               # number of replications
+sigma_base <- 0.5                      # base noise scale → R² ≈ 0.8
+
+# >>>>>>>>>>>>>>>>>>>>>>>> IMPOTANT: ADJUST THIS PATH  <<<<<<<<<<<<<<<<<<<<<<<<
+out_dir <- "./sim_data"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# ------------------------ Block diagonal covariance -------------------------
+create_block_diag <- function(n_blocks, block_size, rho) {
+  blocks <- replicate(n_blocks, 
+                      matrix(rho + (1 - rho) * diag(block_size), 
+                             nrow = block_size), 
+                      simplify = FALSE)
+  as.matrix(Matrix::bdiag(blocks))
+}
+
+Sigma <- create_block_diag(n_blocks, block_size, rho)
+
+# ---------------------- FIXED PARAMETERS (ACROSS REPLICATIONS) --------------
+set.seed(2025)  # Master seed — controls fixed structure across replications
+
+# ---- Fixed coefficient structure ----
+beta <- numeric(p)
+
+# 10% of predictors have larger effects
+large_idx <- sort(sample(1:p, size = 0.1 * p))
+small_idx <- setdiff(1:p, large_idx)
+
+beta[large_idx] <- runif(length(large_idx), 0.2, 0.5) *
+  sample(c(-1, 1), length(large_idx), replace = TRUE)
+beta[small_idx] <- runif(length(small_idx), 0.01, 0.1) *
+  sample(c(-1, 1), length(small_idx), replace = TRUE)
+
+# ---- Fixed misspecification structure ----
+# Quadratic effects on 50 randomly chosen predictors
+quad_vars <- sort(sample(1:p, 50))
+gamma <- runif(50, -0.05, 0.05)  # quadratic coefficients
+
+# Threshold effects on 20 predictors (I(x > 0))
+thresh_vars <- sort(sample(1:p, 20))
+delta <- runif(20, -0.2, 0.2)    # threshold coefficients
+
+# Fixed interaction pairs (100 pairs)
+all_pairs <- list()
+for (b in 1:n_blocks) {
+  idx <- ((b - 1) * block_size + 1):(b * block_size)
+  if (length(idx) >= 2) {
+    pairs_in_block <- combn(idx, 2, simplify = FALSE)
+    all_pairs <- c(all_pairs, pairs_in_block)
+  }
+}
+selected_pairs <- sample(all_pairs, 100, replace = FALSE)
+pair_matrix <- do.call(rbind, selected_pairs)  # matrix for faster access
+theta <- runif(100, -0.1, 0.1)    # interaction coefficients
+
+# ---------------------------- MAIN SIMULATION LOOP ---------------------------
+
+for (rep in 1:R) {
+  cat(sprintf("Replication %d / %d\n", rep, R))
+  
+  # Replication-specific seed (different from master seed)
+  set.seed(2025 + rep)
+  
+  # ---- Generate full data once (largest n), then subsample ----
+  X_full <- mvrnorm(n = max(n_vec), 
+                    mu = rep(0, p), 
+                    Sigma = Sigma, 
+                    empirical = FALSE, 
+                    tol = 1e-6)
+  colnames(X_full) <- paste0("X", 1:p)
+  
+  # Pre-compute linear predictor
+  LP_full <- X_full %*% beta
+  
+  # Pre-compute misspecification effects (only used in layer2)
+  quad_effect_full <- rowSums(sweep(X_full[, quad_vars, drop = FALSE]^2, 
+                                    2, gamma, "*"))
+  
+  thresh_effect_full <- rowSums(sweep(ifelse(X_full[, thresh_vars, drop = FALSE] > 0, 1, 0), 
+                                      2, delta, "*"))
+  
+  inter_effect_full <- rep(0, max(n_vec))
+  for (k in 1:100) {
+    i <- pair_matrix[k, 1]
+    j <- pair_matrix[k, 2]
+    inter_effect_full <- inter_effect_full + theta[k] * X_full[, i] * X_full[, j]
+  }
+  
+  # Heteroscedasticity scaling
+  sigma <- sigma_base * sd(LP_full)
+  het_scale_full <- sigma * abs(LP_full) / sd(LP_full)
+  
+  # ---- Generate noise terms once ----
+  eps_base_full <- rnorm(max(n_vec), mean = 0, sd = sigma)
+  eps_het_full   <- rnorm(max(n_vec), mean = 0, sd = het_scale_full)
+  
+  # ---- Loop over sample sizes ----
+  for (n in n_vec) {
+    idx <- 1:n
+    
+    # Subsample
+    X            <- X_full[idx, , drop = FALSE]
+    LP           <- LP_full[idx]
+    quad_effect  <- quad_effect_full[idx]
+    thresh_effect <- thresh_effect_full[idx]
+    inter_effect <- inter_effect_full[idx]
+    eps_base     <- eps_base_full[idx]
+    eps_het      <- eps_het_full[idx]
+    
+    # ---- Create outcomes ----
+    y_base     <- LP + eps_base
+    y_compound <- LP + quad_effect + thresh_effect + inter_effect + eps_het
+    
+    # ---- Prepare data frames ----
+    df_base     <- data.frame(y = y_base, X)
+    df_compound <- data.frame(y = y_compound, X)
+    
+    # ---- Save as CSV ----
+    cat(sprintf("  Saving rep %d   n = %5d   ... ", rep, n))
+    
+    fwrite(df_base,
+           file.path(out_dir, sprintf("sim_rep%03d_n%05d_layer1.csv", rep, n)),
+           row.names = FALSE,
+           quote = TRUE)
+    
+    fwrite(df_compound,
+           file.path(out_dir, sprintf("sim_rep%03d_n%05d_layer2.csv", rep, n)),
+           row.names = FALSE,
+           quote = TRUE)
+    
+    cat("done\n")
+  }
+}
