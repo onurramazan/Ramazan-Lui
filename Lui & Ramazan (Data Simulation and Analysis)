@@ -1,0 +1,978 @@
+\documentclass[12pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{setspace} \doublespacing
+\usepackage{microtype}
+\usepackage{array}
+\usepackage{caption}
+\usepackage{authblk}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{adjustbox}
+\usepackage{url}
+\usepackage{mathptmx}
+\usepackage[T1]{fontenc}
+
+% Single spacing per journal guidelines
+
+\title{\textbf{Bayesian Regularization under Model Misspecification:\\
+Positioning a Variational \texttt{rstanarm} Benchmark}}
+
+\author[1]{Yiu Wa LUI}
+\author[2]{Onur RAMAZAN}
+\affil[1]{The Chinese University of Hong Kong}
+\affil[2]{The University of Hong Kong}
+\date{\today}
+
+
+% ----- R code listing style -----
+\definecolor{codegray}{rgb}{0.95,0.95,0.95}
+\definecolor{commentgray}{rgb}{0.4,0.4,0.4}
+\definecolor{keyblue}{rgb}{0.0,0.0,0.6}
+\lstdefinestyle{Rstyle}{
+  language=R,
+  backgroundcolor=\color{codegray},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{keyblue}\bfseries,
+  commentstyle=\color{commentgray}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=none,
+  breaklines=true,
+  breakatwhitespace=true,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=6pt,
+  xrightmargin=6pt,
+  showstringspaces=false,
+  tabsize=2,
+  captionpos=b
+}
+\lstset{style=Rstyle}
+\begin{document}
+
+\maketitle
+
+\begin{center}
+\small
+\textbf{Correspondence:} Lui Yiu Wa, The Chinese University of Hong Kong. E-mail: \texttt{[1155213187@link.cuhk.edu.hk]}\\[4pt]
+\textbf{Funding:} This research received no specific grant from any funding agency.\\[4pt]
+\textbf{Conflicts of interest:} The authors declare no conflicts of interest.\\[4pt]
+\textbf{Data \& code availability:} All simulation code is provided in Appendix~A.
+\end{center}
+
+%-----------------------------------------------------------------------
+\begin{abstract}
+Bayesian shrinkage priors offer an appealing alternative to frequentist regularization by providing automatic penalty learning and full uncertainty quantification. Yet their practical performance under model misspecification remains underexamined. The present simulation study benchmarked three Bayesian priors---horseshoe, Laplace (Bayesian lasso), and normal (ridge-type)---implemented via mean-field variational inference in \texttt{rstanarm}, across sample sizes of $n = 500$, $n = 2{,}000$, and $n = 10{,}000$ with $p = 2{,}000$ predictors. Data were generated under a correctly specified linear model (Layer~1) and a compound misspecification incorporating quadratic effects, threshold effects, interactions, and heteroscedastic noise (Layer~2). Predictive accuracy ($R^2$, RMSE), variable selection (95\% credible intervals), and selection stability (mean pairwise Jaccard index) were evaluated over 30 replications. At $n = 10{,}000$, horseshoe and Laplace priors achieved moderate predictive accuracy ($R^2 > .55$) in both layers, whereas the normal prior failed catastrophically at all sample sizes. However, all priors selected nearly all predictors regardless of sample size or layer, which rendered variable selection uninformative. Stability was high but merely reflected the pervasive selection of almost all variables. These findings indicate that default variational inference with \texttt{rstanarm} can yield robust prediction in high dimensions under misspecification when sample sizes are large, but is unreliable for variable selection without careful tuning or more accurate posterior approximations. Applied researchers should critically evaluate the interplay between prior specification, approximate inference, and analytic goals when deploying Bayesian shrinkage methods.
+\end{abstract}
+
+\noindent\textbf{Keywords:} Bayesian statistics; variational inference; Monte Carlo simulation; model misspecification; shrinkage priors; high-dimensional regression
+
+%-----------------------------------------------------------------------
+\section{Introduction}
+
+Modern predictive modeling in psychology and the social sciences increasingly relies on high-dimensional regularized regression. Yet most empirical and methodological work still evaluates methods under well-specified linear models, even though real data frequently violate linearity, homoscedasticity, and additivity. Building on our prior simulation benchmark of frequentist regularization under compound misspecification, the present paper develops a parallel Bayesian benchmark using variational inference and a range of shrinkage priors.
+
+Regularized regression (ridge, lasso, elastic net, and related methods) is now routine, but its robustness is usually assessed assuming correct model specification. The earlier work documented how convex and non-convex penalties (ridge, LASSO, elastic net, adaptive LASSO, SCAD, MCP) degrade when nonlinearity, heteroscedasticity, and omitted interactions are jointly present, under realistic high-dimensional designs and sample sizes $^{1}$. This highlighted that applied users need guidance not only on tuning, but on method choice when models are wrong.
+
+Bayesian penalized regression replaces penalty terms with shrinkage priors such as Normal, Laplace (Bayesian lasso), horseshoe, and spike-and-slab, often yielding competitive or superior prediction and variable selection, with automatic penalty learning and full uncertainty quantification $^{2}$. Carefully designed global--local priors (e.g., horseshoe) can combine near-optimal contraction and variable-selection consistency with practical gains over LASSO-type regularization $^{3}$. Exact Bayesian inference is often computationally prohibitive; variational inference (VI) provides scalable approximate posteriors by turning integration into optimization $^{4}$. Mean-field and related VI schemes have been developed for high-dimensional linear regression with product priors and can be accurate under suitable conditions $^{5}$. User-friendly implementations, such as \texttt{rstanarm}, now expose these ideas to applied researchers $^{2}$.
+
+Bayesian shrinkage methods offer several attractions whether or not the linear model is correct. Under approximate sparsity and correct specification, heavy-tailed priors like the horseshoe and spike-and-slab achieve near-optimal recovery and valid uncertainty, sometimes outperforming frequentist regularization in variable selection and inference $^{3,6}$. Under heavy-tailed errors or robust loss formulations, horseshoe-type priors can still deliver valid credible intervals and strong selection performance $^{7}$. At the same time, generalized and nonparametric Bayesian frameworks have begun to address model misspecification more directly, targeting robustness when both the regression function and error structure are imperfectly modeled $^{8}$. These developments motivate a systematic empirical comparison of practical Bayesian shrinkage implementations, such as \texttt{rstanarm} with Normal, Laplace, horseshoe, and spike-and-slab priors, against frequentist regularization when the data-generating process is deliberately and severely misspecified, extending our previous benchmarking study into the Bayesian domain.
+
+%-----------------------------------------------------------------------
+\section{Methods}
+
+\subsection{Data Generation}
+
+Data were generated from a linear model with correlated predictors. The predictor vector $\mathbf{x} \in \mathbb{R}^p$ with $p = 2{,}000$ was drawn from a multivariate normal distribution with mean zero and block-diagonal covariance matrix $\boldsymbol{\Sigma}$:
+\[
+\mathbf{x} \sim \mathcal{N}(\mathbf{0}, \boldsymbol{\Sigma}).
+\]
+The covariance structure comprised $B = p/20 = 100$ independent blocks of size 20. Within each block the correlation between any two predictors was $\rho = 0.4$, yielding
+\[
+\boldsymbol{\Sigma}_b = \rho \mathbf{J}_{20} + (1-\rho)\mathbf{I}_{20}, \quad b = 1,\ldots,B,
+\]
+and $\boldsymbol{\Sigma} = \operatorname{blockdiag}(\boldsymbol{\Sigma}_1, \boldsymbol{\Sigma}_2, \ldots, \boldsymbol{\Sigma}_B)$, where $\mathbf{J}_{20}$ is the $20\times 20$ matrix of ones and $\mathbf{I}_{20}$ the $20\times 20$ identity matrix.
+
+The coefficient vector $\boldsymbol{\beta} = (\beta_1, \ldots, \beta_p)^\top$ was fixed across all replications. Ten percent of the predictors (200 variables) were assigned larger effects, and the remaining 90\% (1,800 variables) smaller effects. Specifically, letting the set of large-effect indices be a random sample of size $0.1p$ and the rest be the small-effect indices:
+\[
+\beta_j = \begin{cases} 
+s_j u_j, & j \in \text{large},\ \text{where } u_j \sim \mathrm{Unif}(0.2, 0.5),\ s_j \in \{-1, 1\} \text{ with equal probability},\\
+s_j v_j, & j \in \text{small},\ \text{where } v_j \sim \mathrm{Unif}(0.01, 0.1).
+\end{cases}
+\]
+
+The signal-to-noise ratio was controlled via a base error standard deviation $\sigma_{\text{base}} = 0.5$.
+
+\subsection{Misspecification Layers}
+
+For the correctly specified model, the noise was homoscedastic: $\varepsilon \sim \mathcal{N}(0, \sigma^2)$, $\sigma = \sigma_{\text{base}} \cdot \mathrm{sd}(\mathbf{X}\boldsymbol{\beta})$, which yields a theoretical $R^2 \approx 0.8$. The outcome under the well-specified linear model (Layer~1) is therefore
+\[
+y_{\text{base}} = \mathbf{x}^\top\boldsymbol{\beta} + \varepsilon.
+\]
+
+To study robustness under model misspecification, a second outcome variable was constructed (Layer~2) that added three forms of nonlinearity and heteroscedasticity to the linear predictor $\mu = \mathbf{x}^\top\boldsymbol{\beta}$.
+
+\paragraph{Quadratic effects.} Quadratic effects were included on 50 randomly chosen predictors. Letting $\mathcal{Q}$ denote this set ($|\mathcal{Q}| = 50$) and drawing coefficients $\gamma_q \sim \mathrm{Unif}(-0.05, 0.05)$:
+\[
+\text{Quadratic effect} = \sum_{q \in \mathcal{Q}} \gamma_q X_q^2.
+\]
+
+\paragraph{Threshold effects.} Threshold (step-function) effects were introduced on 20 distinct predictors. With $\mathcal{T}$ the set of threshold variables ($|\mathcal{T}| = 20$) and $\delta_t \sim \mathrm{Unif}(-0.2, 0.2)$:
+\[
+\text{Threshold effect} = \sum_{t \in \mathcal{T}} \delta_t \mathbf{1}(X_t > 0).
+\]
+
+\paragraph{Interaction effects.} One hundred within-block pairwise interactions were added. From all possible pairs within the same block, 100 pairs were randomly selected. Denoting the chosen pairs by $(i_m, j_m)$ and their coefficients by $\theta_m \sim \mathrm{Unif}(-0.1, 0.1)$:
+\[
+\text{Interaction effect} = \sum_{m=1}^{100} \theta_m X_{i_m} X_{j_m}.
+\]
+
+Finally, the error term was made heteroscedastic, with its standard deviation scaling linearly with the absolute value of the linear predictor:
+\[
+\varepsilon_{\text{het}} \sim \mathcal{N}\!\left(0,\ \sigma^2 \cdot \frac{|\mu|}{\mathrm{sd}(\mu)}\right),
+\]
+where $\mu$ denotes the linear predictor. The full misspecified outcome is
+\[
+y_{\text{compound}} = \mathbf{x}^\top\boldsymbol{\beta} + \sum_{q \in \mathcal{Q}} \gamma_q X_q^2 + \sum_{t \in \mathcal{T}} \delta_t \mathbf{1}(X_t > 0) + \sum_{m=1}^{100} \theta_m X_{i_m} X_{j_m} + \varepsilon_{\text{het}}.
+\]
+
+All non-linear structures (quadratic, threshold, and interaction terms) as well as the coefficient vector $\boldsymbol{\beta}$ were held constant across the $R = 30$ simulation replications. The only randomness between replications arose from the generation of $\mathbf{X}$ and the noise terms. Three sample sizes were considered: $n \in \{500, 2{,}000, 10{,}000\}$. For each replication and sample size, the largest necessary dataset was generated first and then the first $n$ rows were extracted, ensuring that comparisons across $n$ within a replication used overlapping observations.
+
+\subsection{Analytical Approach}
+
+\subsubsection{Analyses}
+
+Three Bayesian penalized regression models were fitted to each dataset. All models used the same linear form $y = \beta_0 + \mathbf{x}^\top\boldsymbol{\beta} + \varepsilon$, but differed in the prior placed on the regression coefficients $\boldsymbol{\beta} = (\beta_1, \ldots, \beta_p)^\top$. The priors were as follows.
+
+\begin{itemize}
+  \item \textbf{Normal prior (ridge-type):} $\beta_j \sim \mathcal{N}(0, 2.5^2)$ with automatic rescaling of the prior scale based on the data $^{9}$.
+  \item \textbf{Horseshoe prior} $^{10}$: a global--local shrinkage prior defined hierarchically by
+  \[
+  \beta_j \mid \lambda_j, \tau \sim \mathcal{N}(0, \lambda_j^2 \tau^2), \quad \lambda_j \sim C^+(0, 1), \quad \tau \sim C^+(0, 1).
+  \]
+  The prior was implemented via the regularized horseshoe $^{11}$ with tail heaviness controlled by a slab with scale 2.5 and degrees of freedom 4.
+  \item \textbf{Laplace prior (lasso-type)} $^{12}$: $\beta_j \sim \mathrm{Laplace}(0, 1)$, inducing a Bayesian lasso with automatic scale adjustment.
+\end{itemize}
+
+For all models, the intercept $\beta_0$ was given a flat improper prior. The error variance $\sigma_\varepsilon^2$ was assigned the default weakly informative prior of the \texttt{stan\_glm} function (an exponential prior on $\sigma_\varepsilon$ with rate $1/\mathrm{sd}(y)$).
+
+\subsubsection{Variational Inference}
+
+Traditional Bayesian inference often relies on conjugate models, which permit closed-form posterior updates for specific prior--likelihood pairs, or on Markov chain Monte Carlo (MCMC) to approximate the posterior distribution when such closed forms are unavailable $^{13,14,15,16}$. Conjugate models allow fast analytical computation of posteriors but are limited in flexibility because they require particular combinations of priors and likelihoods $^{13,14,17,15,16}$.
+
+MCMC algorithms instead construct a Markov chain whose iterates are samples from (or asymptotically converge to) the posterior and use these samples to approximate posterior quantities, enabling inference for complex and high-dimensional models that lack conjugate structure $^{18,19,20,21,22,23}$. However, MCMC is often computationally costly because it requires many sequential iterations and careful convergence assessment, and it can scale poorly with model complexity, data size, or dimensionality $^{18,19,20,21,24,22,25}$. In high-dimensional settings, where the main goal may be to efficiently identify relevant predictors or obtain approximate uncertainty quantification rather than exact posterior inference, such computational costs can make MCMC unattractive $^{24,18,19}$. In these cases, variational inference (VI) provides a scalable alternative that approximates the posterior by solving an optimization problem, typically achieving substantial speedups relative to MCMC while retaining useful Bayesian features, albeit with potential losses in accuracy and underestimation of uncertainty $^{24,18,26,19,13,22,27,25}$.
+
+Variational inference reframes posterior approximation as an optimization problem. Let $p(\boldsymbol{\theta} \mid \mathbf{y})$ denote the true posterior, which is typically intractable due to the normalizing constant $p(\mathbf{y}) = \int p(\mathbf{y} \mid \boldsymbol{\theta})\, p(\boldsymbol{\theta})\, d\boldsymbol{\theta}$. VI introduces a family of tractable approximating distributions $\mathcal{Q} = \{q(\boldsymbol{\theta}; \boldsymbol{\lambda})\}$, parameterized by variational parameters $\boldsymbol{\lambda}$, and seeks the member of $\mathcal{Q}$ closest to the true posterior in terms of the Kullback--Leibler (KL) divergence $^{28}$:
+\[
+\mathrm{KL}\bigl(q(\boldsymbol{\theta};\boldsymbol{\lambda}) \,\|\, p(\boldsymbol{\theta}\mid\mathbf{y})\bigr) = \mathbb{E}_q\!\left[\log\frac{q(\boldsymbol{\theta};\boldsymbol{\lambda})}{p(\boldsymbol{\theta}\mid\mathbf{y})}\right].
+\]
+
+Since $p(\boldsymbol{\theta}\mid\mathbf{y})$ is unavailable directly, minimizing the KL divergence is reformulated by decomposing the log marginal likelihood (the evidence) as
+\[
+\log p(\mathbf{y}) = \mathcal{L}(\boldsymbol{\lambda}) + \mathrm{KL}\bigl(q(\boldsymbol{\theta};\boldsymbol{\lambda})\,\|\,p(\boldsymbol{\theta}\mid\mathbf{y})\bigr),
+\]
+where $\mathcal{L}(\boldsymbol{\lambda})$ is the evidence lower bound (ELBO), defined as
+\[
+\mathcal{L}(\boldsymbol{\lambda}) = \mathbb{E}_q\bigl[\log p(\mathbf{y}, \boldsymbol{\theta})\bigr] - \mathbb{E}_q\bigl[\log q(\boldsymbol{\theta};\boldsymbol{\lambda})\bigr].
+\]
+Because $\log p(\mathbf{y})$ is constant with respect to $\boldsymbol{\lambda}$ and the KL divergence is non-negative, maximizing the ELBO is equivalent to minimizing the KL divergence, making the ELBO the central objective of variational inference $^{28,29}$.
+
+A widely used approach within this framework is automatic differentiation variational inference (ADVI), implemented in Stan $^{29}$. ADVI automates VI by first applying a differentiable transformation $T: \Theta \to \mathbb{R}^d$ to map all constrained model parameters to an unconstrained space, and then fitting a Gaussian variational family in that transformed space---either a mean-field approximation with a diagonal covariance, or a full-rank approximation with a dense covariance matrix. Gradients of the ELBO with respect to $\boldsymbol{\lambda}$ are computed via automatic differentiation through Stan's computational graph, and the ELBO is maximized using stochastic gradient ascent, where Monte Carlo samples from $q$ are used to estimate the gradient at each iteration $^{29}$. This allows ADVI to be applied to any differentiable probabilistic model expressible in Stan without requiring model-specific derivations, making it a practical and scalable alternative to MCMC for large or complex models.
+
+\subsubsection{Model Estimation and Tuning}
+
+All models were estimated using mean-field variational inference (VI; \citealt{blei2017}) as implemented in the \texttt{rstanarm} package $^{30}$ within the R computing environment $^{31}$. The VI algorithm approximates the true posterior $p(\boldsymbol{\beta}, \sigma_\varepsilon \mid \mathbf{y}, \mathbf{X})$ by a product of independent Gaussian distributions (for unconstrained parameters), minimising the Kullback--Leibler divergence to the exact posterior. Each model was run with 1,000 posterior draws used for prediction and inference. Following advice from the RStanarm team, QR factorization is enabled when the number of observations in the training set is larger than or equal to the number of predictors; QR factorization improves numerical stability and the posterior fit in general and is the recommended approach. No further hyperparameter tuning was performed; the prior hyperparameters mentioned above were used as fixed defaults throughout.
+
+\subsubsection{Performance Evaluation}
+
+For each replication, the data were randomly split into a training set (80\% of observations) and a test set (20\%). Predictors were standardized using the training-set means and standard deviations, and the same transformation was applied to the test set. Predictive performance on the test set was quantified by the coefficient of determination,
+\[
+R^2 = 1 - \frac{\sum_{i=1}^{n_{\text{test}}}(y_i - \hat{y}_i)^2}{\sum_{i=1}^{n_{\text{test}}}(y_i - \bar{y}_{\text{test}})^2},
+\]
+and the root mean squared error,
+\[
+\mathrm{RMSE} = \sqrt{\frac{1}{n_{\text{test}}}\sum_{i=1}^{n_{\text{test}}}(y_i - \hat{y}_i)^2},
+\]
+where $\hat{y}_i$ is the posterior mean prediction for observation $i$.
+
+Variable selection was determined via 95\% credible intervals of the posterior distribution of each $\beta_j$. A predictor was considered selected if its credible interval did not contain zero, i.e., if $P(\hat{\beta}_j > 0 \mid \mathbf{y}) \geq 0.975$ or $P(\hat{\beta}_j < 0 \mid \mathbf{y}) \geq 0.975$.
+
+Selection stability was assessed by the average pairwise Jaccard index across replications. For a given setting (prior, sample size, and layer), let $S_r$ be the set of selected predictors in replication $r$ ($r = 1, \ldots, R$). The Jaccard similarity between two sets is
+\[
+J(S_i, S_j) = \frac{|S_i \cap S_j|}{|S_i \cup S_j|},
+\]
+with $J(\emptyset, \emptyset) = 1$. The average and standard deviation of these pairwise indices,
+\[
+\bar{J} = \frac{2}{R(R-1)}\sum_{i<j} J(S_i, S_j), \qquad \mathrm{SD}(J) = \sqrt{\frac{2}{R(R-1)}\sum_{i<j}\bigl(J(S_i, S_j) - \bar{J}\bigr)^2},
+\]
+summarize the reproducibility of the selected sets.
+
+\subsubsection{Simulation Parameters and Replications}
+
+The design was a full factorial with three sample sizes ($n = 500, 2{,}000, 10{,}000$), two outcome layers (well-specified, misspecified), and three Bayesian prior specifications (normal, horseshoe, Laplace). The number of replications was 30. For each combination, predictive performance ($R^2$ and RMSE) and stability via the mean pairwise Jaccard index were computed. All simulation code was written in R. Results were summarized across replications by means and standard deviations of the performance measures.
+
+%-----------------------------------------------------------------------
+\section{Results}
+
+The present Bayesian simulation study examined the predictive accuracy, variable selection properties, and selection stability of three prior specifications---horseshoe, Laplace (Bayesian lasso), and normal (ridge-type)---across three sample sizes ($n \in \{500, 2{,}000, 10{,}000\}$) and two model misspecification layers. The target of inference was a linear model with $p = 2{,}000$ predictors. Layer~1 represented the correctly specified linear model while Layer~2 incorporated quadratic, threshold, and interaction effects together with heteroscedastic noise. Up to 30 replications were planned per condition, but some fits failed due to numerical issues or exceeded computational resources. The actual number of successful replications for each combination is reported in Tables~\ref{tab:horseshoe}--\ref{tab:normal}.
+
+\subsection{Predictive Performance}
+
+Tables~\ref{tab:horseshoe}--\ref{tab:normal} display the mean $R^2$ and root mean squared error (RMSE) on the held-out test sets. For the horseshoe prior, predictive performance improved markedly with sample size. At $n = 500$, predictions were poor with mean $R^2$ values of $-0.026$ ($SD = 0.042$) for Layer~1 and $-0.027$ ($SD = 0.043$) for Layer~2, and RMSEs near 6.0. At $n = 2{,}000$, $R^2$ became slightly positive (Layer~1: $0.061$, $SD = 0.051$; Layer~2: $0.040$, $SD = 0.046$). With $n = 10{,}000$, the horseshoe prior achieved substantially better accuracy: $R^2$ for Layer~1 reached $.578$ ($SD = 0.130$) and for Layer~2 $.554$ ($SD = 0.235$), with RMSEs dropping to 3.90 and 3.98, respectively.
+
+The Laplace prior yielded a similar pattern of improvement with increasing $n$, although at $n = 2{,}000$ in Layer~1 the results were compromised by extreme predictions in a subset of replications which led to mean $R^2$ and RMSE values on the order of $-4.0 \times 10^{33}$ and $6.8 \times 10^{16}$. These clearly reflect numerical instabilities rather than genuine model performance. Excluding that anomaly, the Laplace prior at $n = 500$ produced negative $R^2$ (Layer~1: $-0.018$, $SD = 0.047$; Layer~2: $-0.038$, $SD = 0.050$). At $n = 2{,}000$ Layer~2, $R^2$ was $.115$ ($SD = 0.044$). At $n = 10{,}000$, the Laplace prior performed comparably to the horseshoe with $R^2$ values of $.616$ (Layer~1) and $.589$ (Layer~2) and RMSEs of 3.76 and 3.89, respectively.
+
+The normal prior, which applies only weak ridge-type shrinkage, produced extremely poor predictions at small and moderate sample sizes. For $n = 500$, mean $R^2$ was below $-9{,}000$ in both layers with very large RMSEs (e.g., Layer~1: $M = -9{,}408.81$, $SD = 2{,}758.55$). At $n = 2{,}000$, $R^2$ remained deeply negative. Even at $n = 10{,}000$, the normal prior failed to achieve positive $R^2$ with means of $-7.80$ (Layer~1) and $-1.07$ (Layer~2), and RMSEs of 14.17 and 8.66, respectively. Thus, the normal prior was unable to provide useful predictions across all conditions tested.
+
+\subsection{Variable Selection}
+
+The number of predictors selected (i.e., whose 95\% credible interval excluded zero) varied systematically with sample size and prior (Tables~\ref{tab:horseshoe}--\ref{tab:normal}). For the horseshoe prior, the mean number of selected variables approached the total $p = 2{,}000$ in most conditions. At $n = 2{,}000$, an average of 1,937 (Layer~1) and 1,789 (Layer~2) variables were selected, and at $n = 10{,}000$ these means were 1,978 and 1,972, respectively. The proportion of replications in which all 2,000 predictors were selected (\textit{prop\_all\_selected}) was above .90 for five of the six horseshoe conditions, indicating that the horseshoe prior did not induce strong sparsity in this high-dimensional setting.
+
+The Laplace prior selected slightly fewer variables on average, with means of 1,725 (Layer~1) and 1,863 (Layer~2) at $n = 500$, which increased to around 1,940 at $n = 10{,}000$. The proportion of all-predictors-selected replications ranged from .72 to .90. The normal prior at $n = 10{,}000$ selected all 2,000 predictors in every successful replication, whereas at smaller sample sizes the mean number selected was lower but highly variable.
+
+\subsection{Selection Stability}
+
+Stability of the selected sets, quantified by the mean pairwise Jaccard index ($\bar{J}$), was generally high for all methods, reflecting the tendency to select nearly all predictors. For the horseshoe prior, $\bar{J}$ exceeded .90 in all conditions except $n = 500$ Layer~1 ($\bar{J} = .902$, $SD = .201$) and $n = 2{,}000$ Layer~2 ($\bar{J} = .801$, $SD = .269$). The Laplace prior showed similar stability with $\bar{J}$ ranging from .748 ($n = 500$ Layer~1) to .941 ($n = 10{,}000$ Layer~2). The normal prior's stability was perfect ($\bar{J} = 1.000$) at $n = 10{,}000$ because exactly all predictors were selected in every replication, whereas at lower sample sizes stability was lower. Overall, stability tended to increase with sample size and the variability of the Jaccard indices (SD) decreased correspondingly.
+
+
+
+
+
+
+
+%-----------------------------------------------------------------------
+\section{Discussion}
+
+The present simulation evaluated three Bayesian shrinkage priors---horseshoe, Laplace, and normal---implemented via mean-field variational inference in \texttt{rstanarm} under both correctly specified linear models and compound misspecification. The results reveal a stark divergence between predictive accuracy and variable selection performance. At the largest sample size ($n = 10{,}000$), both the horseshoe and Laplace priors achieved moderately strong predictive accuracy with $R^2$ values exceeding .55 in both layers and RMSEs dropping substantially relative to smaller samples. This finding aligns with theoretical guarantees that heavy-tailed shrinkage priors can yield near-optimal prediction in high-dimensional regression even when the model is misspecified $^{3,7}$. Importantly, the severe nonlinearities, interactions, and heteroscedasticity of Layer~2 produced only modest degradation in predictive performance for these two priors, suggesting a degree of robustness consistent with recent work on Bayesian nonlinear regression under misspecification $^{8}$ and on robust variable selection with horseshoe-type priors $^{7}$.
+
+In contrast, the normal (ridge-type) prior, which applies only weak Gaussian shrinkage, yielded catastrophic predictive performance across all sample sizes with $R^2$ remaining deeply negative even at $n = 10{,}000$. This emphasized that in $p \gg n$ settings, weak ridge-style regularization is insufficient to control overfitting when many predictors carry weak or no signal---a phenomenon well known in both frequentist and Bayesian literatures $^{9}$. The results thus reinforce the practical superiority of global--local shrinkage priors over simple normal priors in high dimensions.
+
+Despite the promising predictive performance of the horseshoe and Laplace priors at large samples, variable selection based on 95\% credible intervals was strikingly uninformative. Across all conditions, the mean number of selected predictors approached the full set $p = 2{,}000$, and the proportion of replications in which all predictors were selected exceeded .80 in most cases. Even the Laplace prior, which is the Bayesian analogue of the lasso and is expected to induce sparsity $^{12}$, failed to reduce the selected set meaningfully. This contrasts sharply with the variable selection consistency typically claimed for these priors under idealized conditions $^{10,3}$. The near-absence of sparsity likely reflects several interacting factors. First, the default hyperpriors for the horseshoe and Laplace priors in \texttt{rstanarm} may not provide sufficiently strong global shrinkage when $p = 2{,}000$ and signals are dense but weak; the global shrinkage parameter $\tau$ requires careful tuning to achieve sparsity and its posterior under variational inference may be inadequately estimated $^{11}$. Second, mean-field variational inference, which approximates the posterior by a factorized Gaussian, tends to underestimate posterior variances and may fail to capture the heavy tails that drive shrinkage in these priors $^{28,24}$. Consequently, credible intervals remain wide enough to include zero for only a trivial fraction of coefficients, yielding selection of nearly all variables. This pattern mirrors concerns raised about the accuracy of variational approximations for sparse Bayesian models $^{19,18}$.
+
+The Laplace prior exhibited severe numerical instability in the $n = 2{,}000$ Layer~1 condition, which produced implausible $R^2$ and RMSE values on the order of $10^{33}$ and $10^{16}$. Such instability likely stems from convergence failures in the stochastic optimization of the ELBO when the posterior geometry is challenging---an issue documented in VI applications to high-dimensional regression $^{19,22}$. These failures highlight that the computational reliability of default VI implementations cannot be taken for granted, particularly at moderate sample sizes where the likelihood is less informative relative to the prior.
+
+Selection stability as measured by the mean pairwise Jaccard index was consistently high across methods and conditions, often exceeding .90. However, this high stability is a direct consequence of the tendency to select all or nearly all predictors. When the selected set is almost always the full set, the Jaccard index is necessarily near 1. Thus, the stability metric provides little discriminative information in this study and should be interpreted with caution. The observed decreases in Jaccard stability at smaller sample sizes (e.g., Laplace at $n = 500$) correspond to greater variability in the subset of predictors that happen to fall below the selection threshold, reflecting heightened posterior uncertainty rather than meaningful model selection consistency.
+
+%-----------------------------------------------------------------------
+\section{Implications}
+
+The present findings carry several implications for applied researchers who rely on Bayesian shrinkage methods via accessible software such as \texttt{rstanarm}. First, when prediction is the primary goal, the horseshoe and Laplace priors with variational inference can deliver robust performance even under substantial model misspecification, provided that the sample size is sufficiently large ($n = 10{,}000$ in our design). This makes them viable tools for large-scale predictive modeling in psychology and social sciences where complex nonlinearities and heteroscedasticity are common but may not need to be explicitly modeled. Second, the default variational inference implementation in \texttt{rstanarm} with its fixed hyperpriors and mean-field approximation should not be relied upon for variable selection in high dimensions. Researchers who need to identify a sparse set of important predictors must either (a) tune the hyperpriors carefully, such as by adjusting the global scale of the horseshoe $^{11}$, (b) switch to full Markov chain Monte Carlo (MCMC) sampling, which can better capture the posterior tails and thus produce sharper credible intervals $^{18}$, or (c) employ alternative software specifically designed for sparse Bayesian variable selection, such as those using spike-and-slab priors with dedicated stochastic search algorithms $^{24}$. Third, the catastrophic failure of the normal prior at all sample sizes serves as a cautionary tale. Weakly regularized Gaussian priors are entirely inadequate for high-dimensional regression and should be avoided unless strong prior information justifies a dense solution.
+
+More broadly, the present study demonstrates that variational inference, while computationally attractive, can mask the inferential strengths of theoretically well-motivated priors. The gap between the theoretical properties of the horseshoe and Laplace priors $^{10,12}$ and their practical performance under default VI settings underscores the need for careful validation of approximate inference algorithms in realistic data scenarios. The companion frequentist benchmark $^{1}$ further allows a direct comparison of penalized maximum-likelihood methods with Bayesian VI approaches under identical data-generating conditions, offering guidance for method selection based on analytic goals.
+
+%-----------------------------------------------------------------------
+\section{Limitations and Future Directions}
+
+Several limitations of the present study point to avenues for future research. First, only 30 replications were planned and some conditions had fewer successful runs due to convergence failures. This reduces the precision of summary statistics and precludes formal statistical comparisons between methods. Larger replication counts would be necessary for definitive conclusions. Second, the simulation considered only one covariance structure (block-diagonal with $\rho = 0.4$) and one set of fixed effect sizes. The generalizability to other correlation patterns and sparsity levels is unknown. Third, the planned spike-and-slab prior was not included in the final analysis due to computational constraints, which leaves open the question of whether a fully Bayesian model-averaging approach would improve variable selection under VI. Fourth, we used the default hyperparameter settings without any tuning; systematic optimization of the prior hyperparameters (e.g., the global shrinkage scale) might substantially improve sparsity and prediction, but would require additional computational cost. Fifth, the mean-field approximation is known to be a crude approximation to the true posterior, especially for priors with strong dependencies. Future work should compare mean-field VI with full-rank VI or with MCMC to isolate the effects of the approximation $^{28,29}$. Sixth, the computational failures encountered with the Laplace prior at $n = 2{,}000$ warrant detailed investigation of the ELBO optimization landscape and possible remedies, such as better initialization, adaptive step-size schedules, or alternative divergence measures $^{4}$. Finally, integrating these Bayesian results with the frequentist benchmark $^{1}$ would provide a comprehensive view of the relative strengths of penalized likelihood and Bayesian shrinkage methods under misspecification, enabling evidence-based recommendations for applied researchers.
+
+%-----------------------------------------------------------------------
+\section{Conclusion}
+
+The present study benchmarked three Bayesian shrinkage priors---horseshoe, Laplace, and normal---implemented through mean-field variational inference in \texttt{rstanarm} under both a well-specified linear model and a deliberately misspecified model featuring nonlinearity, interactions, and heteroscedasticity. At large sample sizes, the horseshoe and Laplace priors provided robust predictive accuracy whereas the normal prior failed entirely. However, none of the methods achieved meaningful variable selection. The credible intervals under default VI settings selected almost all predictors, yielding spurious completeness. These results underscore that the default variational inference pipeline in \texttt{rstanarm} is suitable for prediction in high dimensions when sample sizes are large, but is unreliable for variable selection without further tuning or the use of more accurate posterior approximations. As Bayesian software becomes increasingly accessible, careful evaluation of the interplay between prior specification, approximate inference algorithms, and study goals is essential to avoid overconfident or misleading inferences. The present work contributes a much-needed empirical perspective to this evaluation and sets the stage for more nuanced methodological guidance.
+
+%-----------------------------------------------------------------------
+\bibliographystyle{unsrt}  % AMA uses numbered refs
+\begin{thebibliography}{99}
+
+\bibitem{ramazan_lui_underreview}
+Ramazan O, Lui YW. Robustness of regularized regression methods under compound model misspecification: A simulation benchmarking study.
+Preprint. PsyArXiv. 2026. \url{https://doi.org/10.31234/osf.io/4s8tq\_v1}
+
+\bibitem{erp2018}
+Erp, S., Oberski, D., \& Mulder, J. (2018).
+Shrinkage priors for Bayesian penalized regression.
+Journal of Mathematical Psychology.
+
+\bibitem{song2017}
+Song, Q., \& Liang, F. (2017).
+Nearly optimal Bayesian shrinkage for high-dimensional regression.
+Science China Mathematics, 66, 409--442.
+
+\bibitem{zhang2019}
+Zhang, C., B{\"u}tepage, J., Kjellstr{\"o}m, H., \& Mandt, S. (2019).
+Advances in variational inference.
+IEEE Transactions on Pattern Analysis and Machine Intelligence, 41(8), 2008--2026.
+
+\bibitem{mukherjee2022}
+Mukherjee, S., \& Sen, S. (2022).
+Variational inference in high-dimensional linear regression.
+Journal of Machine Learning Research, 23, 1--56.
+
+\bibitem{wu2023}
+Wu, T., Narisetty, N., \& Yang, Y. (2023).
+Statistical inference via conditional Bayesian posteriors in high-dimensional linear regression.
+Electronic Journal of Statistics, 17(1), 769--797.
+
+\bibitem{fan2025}
+Fan, K., Subedi, S., Pathiranage, V.~R.~D., \& Wu, C. (2025).
+Robust Bayesian high-dimensional variable selection and inference with the horseshoe family of priors (arXiv:2507.10975).
+
+\bibitem{chen2026}
+Chen, M., Dellaporta, C., Berrett, T.~B., \& Damoulas, T. (2026).
+Total robustness in Bayesian nonlinear regression (arXiv:2510.03131).
+
+\bibitem{gelman2008}
+Gelman, A. (2008).
+Scaling regression inputs by dividing by two standard deviations.
+Statistics in Medicine, 27(15), 2865--2873.
+
+\bibitem{carvalho2010}
+Carvalho, C.~M., Polson, N.~G., \& Scott, J.~G. (2010).
+The horseshoe estimator for sparse signals.
+Biometrika, 97(2), 465--480.
+
+\bibitem{piironen2017}
+Piironen, J., \& Vehtari, A. (2017).
+On the hyperprior choice for the global shrinkage parameter in the horseshoe prior.
+In Proceedings of the 20th International Conference on Artificial Intelligence and Statistics, PMLR 54, 905--913.
+
+\bibitem{park2008}
+Park, T., \& Casella, G. (2008).
+The Bayesian lasso.
+Journal of the American Statistical Association, 103(482), 681--686.
+
+\bibitem{anceschi2022}
+Anceschi, N., Fasano, A., Durante, D., \& Zanella, G. (2022).
+Bayesian conjugacy in probit, tobit, multinomial probit and extensions: A review and new results.
+Journal of the American Statistical Association.
+
+\bibitem{chan2021}
+Chan, J.~C.~C. (2021).
+Asymmetric conjugate priors for large Bayesian VARs.
+SSRN Electronic Journal.
+
+\bibitem{pal2020}
+Pal, S., Sengupta, S., Mitra, R., \& Banerjee, A. (2020).
+Conjugate priors and posterior inference for the matrix Langevin distribution on the Stiefel manifold.
+Bayesian Analysis.
+
+\bibitem{xu2025}
+Xu, A., \& Wang, W. (2025).
+Recursive Bayesian prediction of remaining useful life for gamma degradation process under conjugate priors.
+Scandinavian Journal of Statistics.
+
+\bibitem{chen2008}
+Chen, M.-H., Huang, L., Ibrahim, J.~G., \& Kim, S. (2008).
+Bayesian variable selection and computation for generalized linear models with conjugate priors.
+Bayesian Analysis.
+
+\bibitem{leeuwen2025}
+Leeuwen, F.~D.~V., \& van Erp, S.~V. (2025).
+To MCMC or not to MCMC: Evaluating non-MCMC methods for Bayesian penalized regression.
+
+\bibitem{hansen2023}
+Hansen, B., Avalos-Pacheco, A., Russo, M., \& De Vito, R. (2023).
+Fast variational inference for Bayesian factor analysis in single and multi-study settings.
+Journal of Computational and Graphical Statistics.
+
+\bibitem{izzatullah2021}
+Izzatullah, M., van Leeuwen, T., \& Peter, D. (2021).
+Bayesian seismic inversion: A fast sampling Langevin dynamics Markov chain Monte Carlo method.
+Geophysical Journal International.
+
+\bibitem{piras2024}
+Piras, D., Polanska, A., Mancini, A., Price, M.~A., \& McEwen, J.~D. (2024).
+The future of cosmological likelihood-based inference: Accelerated high-dimensional parameter estimation and model comparison.
+
+\bibitem{povala2021}
+Povala, J., Kazlauskaite, I., Febrianto, E., Cirak, F., \& Girolami, M. (2021).
+Variational Bayesian approximation of inverse problems using sparse precision matrices.
+Computer Methods in Applied Mechanics and Engineering.
+
+\bibitem{zhou2021}
+Zhou, Q., Yang, J., Vats, D., Roberts, G.~O., \& Rosenthal, J.~S. (2021).
+Dimension-free mixing for high-dimensional Bayesian variable selection.
+Journal of the Royal Statistical Society: Series B.
+
+\bibitem{carbonetto2012}
+Carbonetto, P., \& Stephens, M. (2012).
+Scalable variational inference for Bayesian variable selection in regression, and its accuracy in genetic association studies.
+Bayesian Analysis.
+
+\bibitem{gunapati2018}
+Gunapati, G., Jain, A., Srijith, P.~K., \& Desai, S. (2018).
+Variational inference as an alternative to MCMC for parameter estimation and model selection.
+Publications of the Astronomical Society of Australia.
+
+\bibitem{sommerfelt2024}
+Sommerfelt, P.~S.~H., \& Hubin, A. (2024).
+Evolutionary variational inference for Bayesian generalized nonlinear models.
+Neural Computing and Applications.
+
+\bibitem{rodrigues2022}
+Rodrigues, F. (2022).
+Scaling Bayesian inference of mixed multinomial logit models to large datasets.
+Transportation Research Part B: Methodological.
+
+\bibitem{blei2017}
+Blei, D.~M., Kucukelbir, A., \& McAuliffe, J.~D. (2017).
+Variational inference: A review for statisticians.
+Journal of the American Statistical Association, 112(518), 859--877.
+
+\bibitem{kucukelbir2017}
+Kucukelbir, A., Tran, D., Ranganath, R., Gelman, A., \& Blei, D.~M. (2017).
+Automatic differentiation variational inference.
+Journal of Machine Learning Research, 18(14), 1--45.
+
+\bibitem{goodrich2025}
+Goodrich, B., Gabry, J., Ali, I., \& Brilleman, S. (2025).
+rstanarm: Bayesian applied regression modeling via Stan (R package version 2.32.2).
+\url{https://mc-stan.org/rstanarm/}
+
+\bibitem{rcoreteam2024}
+R Core Team. (2024).
+R: A language and environment for statistical computing.
+R Foundation for Statistical Computing, Vienna, Austria.
+\url{https://www.R-project.org/}
+
+\end{thebibliography}
+
+
+
+\clearpage
+\section*{Tables}
+
+%--- Table 1: Horseshoe
+\begin{table}[p]
+\centering
+\caption{Bayesian Simulation Results for the Horseshoe Prior by Sample Size and Layer}
+\label{tab:horseshoe}
+\singlespacing
+\begin{adjustbox}{max width=\textwidth}
+\begin{tabular}{cccccccccccc}
+\toprule
+$n$ & Layer & $n_{\text{reps}}$ & $R^2$ (M) & $R^2$ (SD) & RMSE (M) & RMSE (SD) & Sel. (M) & Sel. (SD) & Prop. All & $\bar{J}$ (M) & $\bar{J}$ (SD) \\
+\midrule
+500   & 1 & 30 & $-0.026$ & 0.042 & 6.022 & 0.495 & 1899.97 & 305.27 & .900 & .902 & .201 \\
+500   & 2 & 30 & $-0.027$ & 0.043 & 5.953 & 0.646 & 1966.70 & 182.39 & .967 & .967 & .125 \\
+2000  & 1 & 30 & $0.061$  & 0.051 & 5.877 & 0.246 & 1936.73 & 240.82 & .933 & .937 & .161 \\
+2000  & 2 & 30 & $0.040$  & 0.046 & 5.875 & 0.344 & 1789.20 & 436.70 & .800 & .801 & .269 \\
+10000 & 1 & 30 & $0.578$  & 0.130 & 3.903 & 0.532 & 1978.00 & 120.50 & .967 & .978 & .082 \\
+10000 & 2 & 30 & $0.554$  & 0.235 & 3.978 & 0.803 & 1972.37 & 105.19 & .933 & .973 & .071 \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\vspace{2pt}
+\begin{minipage}{\textwidth}
+\footnotesize \textit{Note.} $n_{\text{reps}}$ = number of successful replications; $R^2$ = coefficient of determination; RMSE = root mean squared error; Sel. (M) = mean number of predictors selected; Prop. All = proportion of replications where all 2,000 predictors were selected; $\bar{J}$ = mean pairwise Jaccard stability index.
+\end{minipage}
+\end{table}
+
+\clearpage
+%--- Table 2: Laplace
+\begin{table}[p]
+\centering
+\caption{Bayesian Simulation Results for the Laplace Prior by Sample Size and Layer}
+\label{tab:laplace}
+\singlespacing
+\begin{adjustbox}{max width=\textwidth}
+\begin{tabular}{cccccccccccc}
+\toprule
+$n$ & Layer & $n_{\text{reps}}$ & $R^2$ (M) & $R^2$ (SD) & RMSE (M) & RMSE (SD) & Sel. (M) & Sel. (SD) & Prop. All & $\bar{J}$ (M) & $\bar{J}$ (SD) \\
+\midrule
+500   & 1 & 29 & $-0.018$       & 0.047         & 5.998          & 0.511          & 1725.45 & 452.78 & .724 & .748 & .264 \\
+500   & 2 & 29 & $-0.038$       & 0.050         & 5.946          & 0.655          & 1862.69 & 349.41 & .862 & .868 & .224 \\
+2000  & 1 & 30 & $-4.0\times10^{33}$$^{\dagger}$ & $2.2\times10^{34}$$^{\dagger}$ & $6.8\times10^{16}$$^{\dagger}$ & $3.7\times10^{17}$$^{\dagger}$ & 1831.13 & 391.18 & .833 & .839 & .247 \\
+2000  & 2 & 28 & $0.115$        & 0.044         & 5.636          & 0.297          & 1902.46 & 286.89 & .893 & .905 & .188 \\
+10000 & 1 & 29 & $0.616$        & 0.042         & 3.759          & 0.192          & 1940.28 & 179.75 & .897 & .941 & .119 \\
+10000 & 2 & 27 & $0.589$        & 0.043         & 3.891          & 0.213          & 1940.41 & 171.79 & .889 & .941 & .113 \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\vspace{2pt}
+\begin{minipage}{\textwidth}
+\footnotesize $^{\dagger}$The extreme values in the $n = 2,000$, Layer~1 condition result from numerical instabilities in a subset of replications and are not substantively interpretable. \textit{Note.} $n_{\text{reps}}$ = number of successful replications; $R^2$ = coefficient of determination; RMSE = root mean squared error; Sel. (M) = mean number of predictors selected; Prop. All = proportion of replications where all 2,000 predictors were selected; $\bar{J}$ = mean pairwise Jaccard stability index.
+\end{minipage}
+\end{table}
+
+\clearpage
+%--- Table 3: Normal
+\begin{table}[p]
+\centering
+\caption{Bayesian Simulation Results for the Normal Prior by Sample Size and Layer}
+\label{tab:normal}
+\singlespacing
+\begin{adjustbox}{max width=\textwidth}
+\begin{tabular}{cccccccccccc}
+\toprule
+$n$ & Layer & $n_{\text{reps}}$ & $R^2$ (M) & $R^2$ (SD) & RMSE (M) & RMSE (SD) & Sel. (M) & Sel. (SD) & Prop. All & $\bar{J}$ (M) & $\bar{J}$ (SD) \\
+\midrule
+500   & 1 & 28 & $-9408.81$ & 2758.55 & 565.97 & 73.51 & 1679.96 & 473.61 & .679 & .712 & .267 \\
+500   & 2 & 27 & $-9190.20$ & 3690.55 & 540.35 & 82.86 & 1578.37 & 527.45 & .556 & .633 & .277 \\
+2000  & 1 & 27 & $-3958.98$ & 1398.44 & 376.49 & 59.69 & 1927.56 & 261.04 & .926 & .928 & .174 \\
+2000  & 2 & 27 & $-4403.96$ & 1159.33 & 393.63 & 59.11 & 1909.11 & 334.95 & .926 & .910 & .223 \\
+10000 & 1 & 25 & $-7.80$    & 14.48   & 14.17  & 11.30 & 2000.00 & 0.00   & 1.000 & 1.000 & .000 \\
+10000 & 2 & 19 & $-1.07$    & 0.61    & 8.66   & 1.20  & 2000.00 & 0.00   & 1.000 & 1.000 & .000 \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\vspace{2pt}
+\begin{minipage}{\textwidth}
+\footnotesize \textit{Note.} $n_{\text{reps}}$ = number of successful replications; $R^2$ = coefficient of determination; RMSE = root mean squared error; Sel. (M) = mean number of predictors selected; Prop. All = proportion of replications where all 2,000 predictors were selected; $\bar{J}$ = mean pairwise Jaccard stability index.
+\end{minipage}
+\end{table}
+
+
+
+
+
+
+%-----------------------------------------------------------------------
+\clearpage
+\appendix
+\section*{Appendix A: R Simulation Code}
+
+The following R script implements the full simulation study described in the Methods section.
+It fits horseshoe, Laplace (Bayesian lasso), and normal (ridge-type) priors via mean-field
+variational inference using \texttt{rstanarm}, records per-replication predictive accuracy
+($R^2$, RMSE), variable selection counts, and selection stability (Jaccard index), and
+writes per-replication and summary \texttt{.csv} files to disk.
+
+\begin{lstlisting}[caption={Bayesian simulation study: VB mean-field variable selection and accuracy (\texttt{bayes\_selection\_final.R})}, label={lst:rcode}, language=R]
+# ------------------------------------------------------------------------------
+# Bayesian simulation study — VB meanfield, variable selection + accuracy
+#
+# Fits horseshoe, normal, and laplace priors via VB (meanfield) for all
+# (rep, n, layer) combinations and records per replication:
+#   - R2, RMSE on held-out test set
+#   - number of NON-INTERCEPT variables selected (95% CI excludes zero)
+#   - whether ALL p=2000 predictors were selected
+#   - active predictor indices (for Jaccard stability)
+#
+# Summary per (method, n, layer):
+#   - R2_mean, R2_sd, RMSE_mean, RMSE_sd
+#   - n_selected_mean, n_selected_sd, n_selected_min, n_selected_max
+#   - n_all_selected, prop_all_selected
+#   - Jaccard_stability_mean, Jaccard_stability_sd
+#
+# Output directory: /home/roy/Documents/Onur_ML/Bayesian_stuff/Bayesian_code_final
+# ------------------------------------------------------------------------------
+
+required_packages <- c("rstanarm", "dplyr", "data.table")
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# ------------------------------ Parameters ------------------------------------
+n_vec       <- c(500, 2000, 10000)
+R_start     <- 1
+R_end       <- 30
+layer_names <- 1:2
+P_TOTAL     <- 2000  # number of non-intercept predictors
+
+bayes_methods <- c("horseshoe", "normal", "laplace")
+method_n_vec  <- list(
+  horseshoe = c(500, 2000, 10000),
+  normal    = c(500, 2000, 10000),
+  laplace   = c(500, 2000, 10000)
+)
+
+# >>>>>>>>>> ADJUST TO YOUR PATHS <<<<<<<<<<
+data_dir <- "/home/roy/Documents/Onur_ML/ml/sim_data"
+out_dir  <- "/home/roy/Documents/Onur_ML/Bayesian_stuff/Bayesian_code_final"
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# ------------------------------ File helpers ----------------------------------
+safe_read_csv <- function(path, ...) {
+  if (!file.exists(path)) return(NULL)
+  info <- file.info(path)
+  if (is.na(info$size) || info$size <= 0) return(NULL)
+  tryCatch(read.csv(path, stringsAsFactors = FALSE, ...), error = function(e) NULL)
+}
+
+safe_read_rds <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  info <- file.info(path)
+  if (is.na(info$size) || info$size <= 0) return(NULL)
+  tryCatch(readRDS(path), error = function(e) NULL)
+}
+
+append_csv <- function(path, df) {
+  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) return(invisible(FALSE))
+  old <- safe_read_csv(path)
+  if (is.null(old) || nrow(old) == 0) {
+    write.csv(df, path, row.names = FALSE)
+  } else {
+    write.csv(rbind(old, df), path, row.names = FALSE)
+  }
+  invisible(TRUE)
+}
+
+append_tsv_line <- function(path, df_line) {
+  if (is.null(df_line) || !is.data.frame(df_line) || nrow(df_line) != 1)
+    return(invisible(FALSE))
+  if (!file.exists(path) || isTRUE(file.info(path)$size == 0))
+    write.table(df_line, path, sep = "\t", row.names = FALSE,
+                col.names = TRUE,  quote = FALSE)
+  else
+    write.table(df_line, path, sep = "\t", row.names = FALSE,
+                col.names = FALSE, quote = FALSE, append = TRUE)
+  invisible(TRUE)
+}
+
+# ------------------------------ Metrics --------------------------------------
+calc_accuracy <- function(y_true, y_pred) {
+  ss_res <- sum((y_true - y_pred)^2)
+  ss_tot <- sum((y_true - mean(y_true))^2)
+  c(R2   = 1 - ss_res / ss_tot,
+    RMSE = sqrt(mean((y_true - y_pred)^2)))
+}
+
+# ------------------------------ Jaccard helpers ------------------------------
+jaccard_pair <- function(s1, s2) {
+  if (!length(s1) && !length(s2)) return(1)
+  if (!length(s1) || !length(s2)) return(0)
+  length(intersect(s1, s2)) / length(union(s1, s2))
+}
+
+pairwise_jaccard_stats <- function(lst) {
+  k <- length(lst)
+  if (k < 2) return(c(mean = NA_real_, sd = NA_real_))
+  jv <- vapply(
+    combn(k, 2, simplify = FALSE),
+    function(i) jaccard_pair(lst[[i[1]]], lst[[i[2]]]),
+    numeric(1)
+  )
+  c(mean = mean(jv, na.rm = TRUE), sd = sd(jv, na.rm = TRUE))
+}
+
+# ------------------------------ Prior helpers ---------------------------------
+get_prior_choice <- function(method) {
+  switch(
+    method,
+    normal    = normal(location = 0, scale = 2.5, autoscale = TRUE),
+    horseshoe = hs(df = 1, global_df = 1, global_scale = 1,
+                   slab_scale = 2.5, slab_df = 4),
+    laplace   = lasso(df = 1, location = 0, scale = 1, autoscale = TRUE),
+    stop("Unknown method: ", method)
+  )
+}
+
+# ------------------------------ VB fit ----------------------------------------
+# Returns:
+#   - pred      : test-set predictions
+#   - n_selected: count of selected predictors (intercept & sigma excluded by name)
+#   - active    : integer indices of selected predictor columns (1-based, into X)
+#   - diag      : diagnostic string
+fit_vb_once <- function(X_train, y_train, X_test, method, seed) {
+  use_qr   <- nrow(X_train) > ncol(X_train)
+  df_train <- data.frame(y = y_train, X_train, check.names = FALSE)
+  df_test  <- data.frame(X_test, check.names = FALSE)
+
+  fit <- suppressWarnings(
+    stan_glm(
+      y ~ .,
+      data                 = df_train,
+      prior                = get_prior_choice(method),
+      algorithm            = "meanfield",
+      iter                 = 20000,
+      importance_resampling = TRUE,
+      QR                   = use_qr,
+      seed                 = seed,
+      tol_rel_obj          = 0.005
+    )
+  )
+
+  pred_test  <- colMeans(posterior_epred(fit, newdata = df_test))
+
+  # Exclude intercept and sigma by name — robust regardless of column ordering
+  beta_draws   <- as.matrix(fit)
+  predictor_cols <- !colnames(beta_draws) %in% c("(Intercept)", "sigma")
+  beta_pred    <- beta_draws[, predictor_cols, drop = FALSE]
+
+  ci           <- apply(beta_pred, 2, quantile, probs = c(0.025, 0.975))
+  local_active <- which(ci[1, ] > 0 | ci[2, ] < 0)  # column positions in beta_pred
+  n_selected   <- length(local_active)
+
+  # Store as named character vector of predictor names for Jaccard
+  active_names <- colnames(beta_pred)[local_active]
+
+  diag_str <- sprintf("algorithm=VB_meanfield QR=%s", use_qr)
+  rm(beta_draws, beta_pred, fit); gc(verbose = FALSE)
+
+  list(pred = pred_test, n_selected = n_selected,
+       active = active_names, diag = diag_str)
+}
+
+# ------------------------------ Dataset processor -----------------------------
+process_one_dataset <- function(fname, rep, n, layer, method) {
+  df <- tryCatch(fread(fname), error = function(e) NULL)
+  if (is.null(df))
+    return(list(ok = FALSE, reason = paste("Unreadable file:", fname)))
+  if (!"y" %in% names(df))
+    return(list(ok = FALSE, reason = paste("Missing y column:", fname)))
+
+  y <- df$y
+  X <- as.matrix(df[, -1, with = FALSE])
+  rm(df)
+
+  if (length(y) != nrow(X))
+    return(list(ok = FALSE, reason = paste("Length mismatch in:", fname)))
+  if (nrow(X) != n)
+    return(list(ok = FALSE, reason = paste("n mismatch, expected", n, "got", nrow(X))))
+
+  set.seed(rep * 100 + n * 10 + layer)
+  n_train   <- floor(0.8 * n)
+  train_idx <- sample.int(n, size = n_train)
+  test_idx  <- setdiff(seq_len(n), train_idx)
+
+  X_train <- X[train_idx, , drop = FALSE]; y_train <- y[train_idx]
+  X_test  <- X[test_idx,  , drop = FALSE]; y_test  <- y[test_idx]
+  rm(X, y, train_idx, test_idx)
+
+  # Standardise on train statistics
+  x_mean <- colMeans(X_train)
+  x_sd   <- apply(X_train, 2, sd)
+  x_sd[!is.finite(x_sd) | x_sd == 0] <- 1
+  X_train <- scale(X_train, center = x_mean, scale = x_sd)
+  X_test  <- scale(X_test,  center = x_mean, scale = x_sd)
+  storage.mode(X_train) <- "double"
+  storage.mode(X_test)  <- "double"
+
+  fit_res <- tryCatch(
+    fit_vb_once(X_train, y_train, X_test, method,
+                seed = rep * 1000 + n * 10 + layer),
+    error = function(e) list(error = conditionMessage(e))
+  )
+
+  rm(X_train, y_train, X_test); gc(verbose = FALSE)
+
+  if (!is.null(fit_res$error))
+    return(list(ok = FALSE, reason = paste("Fit failed:", fit_res$error)))
+
+  acc <- calc_accuracy(y_test, fit_res$pred)
+  rm(y_test); gc(verbose = FALSE)
+
+  list(
+    ok  = TRUE,
+    row = data.frame(
+      method       = method,
+      rep          = rep,
+      n            = n,
+      layer        = layer,
+      R2           = unname(acc["R2"]),
+      RMSE         = unname(acc["RMSE"]),
+      n_selected   = fit_res$n_selected,
+      all_selected = as.integer(fit_res$n_selected == P_TOTAL),
+      diag         = fit_res$diag,
+      stringsAsFactors = FALSE
+    ),
+    active = list(rep = rep, n = n, layer = layer, active = fit_res$active)
+  )
+}
+
+# ------------------------------ Main method runner ----------------------------
+process_bayes_method <- function(method, start_rep = R_start, end_rep = R_end,
+                                 n_vec_method = n_vec) {
+  cat("\n", paste(rep("=", 60), collapse = ""), "\n", sep = "")
+  cat("Processing VB method:", method, "\n")
+  cat(paste(rep("=", 60), collapse = ""), "\n", sep = "")
+
+  abs_data_dir <- normalizePath(data_dir, mustWork = FALSE)
+  abs_out_dir  <- normalizePath(out_dir,  mustWork = FALSE)
+  if (!dir.exists(abs_out_dir)) dir.create(abs_out_dir, recursive = TRUE)
+
+  per_rep_file    <- file.path(abs_out_dir, paste0("per_rep_", method, ".csv"))
+  active_rds_file <- file.path(abs_out_dir, paste0(method, "_active_sets.rds"))
+  log_file        <- file.path(abs_out_dir, paste0("runlog_", method, ".tsv"))
+
+  existing <- safe_read_csv(per_rep_file)
+  if (file.exists(per_rep_file) && is.null(existing)) {
+    cat("Existing per-rep file unreadable; removing.\n")
+    file.remove(per_rep_file); existing <- NULL
+  }
+
+  start_from <- start_rep
+  if (!is.null(existing) && nrow(existing) > 0 && "rep" %in% names(existing)) {
+    last_rep <- suppressWarnings(max(existing$rep, na.rm = TRUE))
+    if (is.finite(last_rep) && last_rep >= start_rep) {
+      start_from <- last_rep + 1
+      cat("Resuming from replication", start_from, "\n")
+    }
+  }
+
+  if (start_from > end_rep) { cat("Already completed.\n"); return(TRUE) }
+
+  # Load existing active sets (for resume)
+  all_active <- safe_read_rds(active_rds_file)
+  if (is.null(all_active) || !is.list(all_active)) all_active <- list()
+  if (length(all_active) > 0) {
+    keep <- vapply(all_active, function(x)
+      is.list(x) && !is.null(x$rep) && length(x$rep) == 1 &&
+        is.finite(x$rep) && x$rep < start_from, logical(1))
+    all_active <- all_active[keep]
+    cat("Loaded", length(all_active), "existing active sets\n")
+  }
+
+  todo <- expand.grid(
+    rep   = seq.int(start_from, end_rep),
+    n     = n_vec_method,
+    layer = layer_names,
+    KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE
+  )
+  todo <- todo[order(todo$rep, todo$n, todo$layer), , drop = FALSE]
+  cat("Planned datasets:", nrow(todo), "\n")
+
+  for (i in seq_len(nrow(todo))) {
+    rep_i <- todo$rep[i]; n_i <- todo$n[i]; layer_i <- todo$layer[i]
+    fname <- file.path(abs_data_dir,
+                       sprintf("sim_rep%03d_n%d_layer%d.csv", rep_i, n_i, layer_i))
+
+    cat(sprintf("[%s] rep=%03d n=%d layer=%d ... ", method, rep_i, n_i, layer_i))
+
+    if (!file.exists(fname)) {
+      cat("missing file\n")
+      append_tsv_line(log_file, data.frame(rep = rep_i, n = n_i, layer = layer_i,
+        method = method, status = "missing_file", message = fname,
+        stringsAsFactors = FALSE))
+      next
+    }
+
+    res <- process_one_dataset(fname, rep_i, n_i, layer_i, method)
+
+    if (!isTRUE(res$ok)) {
+      cat("failed:", res$reason, "\n")
+      append_tsv_line(log_file, data.frame(rep = rep_i, n = n_i, layer = layer_i,
+        method = method, status = "failed", message = res$reason,
+        stringsAsFactors = FALSE))
+      gc(verbose = FALSE); next
+    }
+
+    append_csv(per_rep_file, res$row)
+    all_active[[length(all_active) + 1]] <- res$active
+    saveRDS(all_active, active_rds_file)
+
+    append_tsv_line(log_file, data.frame(rep = rep_i, n = n_i, layer = layer_i,
+      method = method, status = "ok",
+      message = sprintf("R2=%.4f RMSE=%.4f n_selected=%d all=%d",
+                        res$row$R2, res$row$RMSE,
+                        res$row$n_selected, res$row$all_selected),
+      stringsAsFactors = FALSE))
+    cat(sprintf("ok [R2=%.4f RMSE=%.4f n_selected=%d all=%d]\n",
+                res$row$R2, res$row$RMSE,
+                res$row$n_selected, res$row$all_selected))
+    rm(res); gc(verbose = FALSE)
+  }
+
+  final <- safe_read_csv(per_rep_file)
+  if (!is.null(final) && nrow(final) > 0) {
+    last_rep <- suppressWarnings(max(final$rep, na.rm = TRUE))
+    if (is.finite(last_rep) && last_rep >= end_rep) { cat("Completed.\n"); return(TRUE) }
+    cat("Incomplete. Last rep:", last_rep, "\n"); return(FALSE)
+  }
+  cat("Failed: no valid rows written.\n"); return(FALSE)
+}
+
+# ------------------------------ Main loop -------------------------------------
+for (method in bayes_methods) {
+  process_bayes_method(method, n_vec_method = method_n_vec[[method]])
+}
+
+# ------------------------------ Build summaries + Jaccard --------------------
+cat("\n", paste(rep("=", 60), collapse = ""), "\n", sep = "")
+cat("Building summaries across all methods\n")
+cat(paste(rep("=", 60), collapse = ""), "\n", sep = "")
+
+all_per_rep <- do.call(rbind, Filter(
+  function(x) !is.null(x) && nrow(x) > 0,
+  lapply(bayes_methods, function(m)
+    safe_read_csv(file.path(out_dir, paste0("per_rep_", m, ".csv"))))
+))
+
+# Compute Jaccard per method from saved RDS files
+jaccard_summary <- data.frame()
+
+for (method in bayes_methods) {
+  cat("Computing Jaccard stability for:", method, "\n")
+  all_active <- safe_read_rds(file.path(out_dir, paste0(method, "_active_sets.rds")))
+  if (is.null(all_active) || length(all_active) == 0) {
+    cat("  No active sets found — skipping.\n"); next
+  }
+
+  active_df <- do.call(rbind, lapply(all_active, function(x)
+    data.frame(rep = x$rep, n = x$n, layer = x$layer, stringsAsFactors = FALSE)))
+  active_df$active_id <- lapply(all_active, function(x) x$active)
+
+  n_vec_m     <- sort(unique(active_df$n))
+  layer_vec_m <- sort(unique(active_df$layer))
+
+  for (n_val in n_vec_m) {
+    for (layer_val in layer_vec_m) {
+      idx   <- which(active_df$n == n_val & active_df$layer == layer_val)
+      stats <- if (length(idx) >= 2)
+        pairwise_jaccard_stats(active_df$active_id[idx])
+      else
+        c(mean = NA_real_, sd = NA_real_)
+
+      jaccard_summary <- rbind(jaccard_summary, data.frame(
+        method                 = method,
+        n                      = n_val,
+        layer                  = layer_val,
+        Jaccard_stability_mean = unname(stats["mean"]),
+        Jaccard_stability_sd   = unname(stats["sd"]),
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+}
+
+if (!is.null(all_per_rep) && nrow(all_per_rep) > 0) {
+
+  write.csv(all_per_rep,
+            file.path(out_dir, "per_rep_all.csv"),
+            row.names = FALSE)
+
+  summary_df <- all_per_rep %>%
+    group_by(method, n, layer) %>%
+    summarise(
+      n_reps            = n(),
+      R2_mean           = mean(R2,           na.rm = TRUE),
+      R2_sd             = sd(R2,             na.rm = TRUE),
+      RMSE_mean         = mean(RMSE,         na.rm = TRUE),
+      RMSE_sd           = sd(RMSE,           na.rm = TRUE),
+      n_selected_mean   = mean(n_selected,   na.rm = TRUE),
+      n_selected_sd     = sd(n_selected,     na.rm = TRUE),
+      n_selected_min    = min(n_selected,    na.rm = TRUE),
+      n_selected_max    = max(n_selected,    na.rm = TRUE),
+      n_all_selected    = sum(all_selected,  na.rm = TRUE),
+      prop_all_selected = mean(all_selected, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(method, n, layer)
+
+  # Join Jaccard into summary
+  if (nrow(jaccard_summary) > 0) {
+    summary_df <- summary_df %>%
+      left_join(jaccard_summary, by = c("method", "n", "layer"))
+  }
+
+  write.csv(as.data.frame(summary_df),
+            file.path(out_dir, "summary_all.csv"),
+            row.names = FALSE)
+
+  cat("\nSummary table:\n")
+  print(as.data.frame(summary_df), row.names = FALSE)
+
+} else {
+  cat("No per-replication data found — nothing to summarise.\n")
+}
+
+cat("\n", paste(rep("=", 60), collapse = ""), "\n", sep = "")
+cat("Done. Output in:", out_dir, "\n")
+cat(" - per_rep_<method>.csv         : per-rep results per method\n")
+cat(" - <method>_active_sets.rds     : active predictor name sets per rep\n")
+cat(" - per_rep_all.csv              : all methods combined\n")
+cat(" - summary_all.csv              : accuracy + selection + Jaccard summary\n")
+cat(" - runlog_<method>.tsv          : run log per method\n")
+
+\end{lstlisting}
+
+\end{document}
